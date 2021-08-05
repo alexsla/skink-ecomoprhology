@@ -1,0 +1,1599 @@
+---
+title: "Elevation is a stronger predictor of morphological trait divergence than competition in a radiation of tropical lizards"
+output:
+  word_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(magrittr)
+source("Code/Functions.R")
+```
+
+This is the code accompanying the manuscript "Elevation is a stronger predictor of morphological trait divergence than competition in a radiation of tropical lizards". The code uses morphometric data on PNG skinks and quantifies their morphospace using PCA. It then calculates volumes of the morphospace occuppied by each species, and compares several metrics between cells in PNG. Thus, it allows for exploration of spatial patterns in morphospace occupancy and their correlates. A full description of the methods can be found in the manuscript.
+
+
+The data required for the analyses are contained in the Data folder, and are loaded in the following chunk:
+```{r data, message=FALSE, warning=FALSE, include = FALSE}
+grid.25 <- maptools::readShapePoly("Data/PNG_25")
+skink.dat <- maptools::readShapePoly("Data/PNG_Scincidae")
+png.dem <- raster::raster("Data/PNG_DEM.tif")
+png.dem[png.dem == 0] <- NA
+dat <- readr::read_csv("Data/data_pca.csv")
+```
+
+## Data Prep
+### Quarter-degree Grid
+In this section we intersect the shapefiles of PNG skinks with the quarter-degree grid. We then extract the data from the grid for analyses.
+
+```{r intersections, message=FALSE, warning=FALSE, include = FALSE}
+#set the projections for the shapefiles
+behrmann.p <- raster::crs("+proj=cea +lon_0=0 +lat_ts=30 +x_0=0 +y_0=0 +datum=WGS84 +ellps=WGS84 +units=m +no_defs")
+sp::proj4string(grid.25) <- behrmann.p
+sp::proj4string(skink.dat) <- behrmann.p
+
+#intersect with the grid
+skink.dat <- rgeos::gBuffer(skink.dat, byid = TRUE, width = 0)
+skink.25 <- raster::intersect(grid.25, skink.dat)
+skink.dis <- maptools::unionSpatialPolygons(skink.25, IDs = skink.25@data$Mapfile)
+
+#save the intersected shapefiles
+rgdal::writeOGR(skink.25, "Results/Scincidae_25", layer = "Scincidae_25", driver = "ESRI Shapefile")
+
+#extract the data from the intersected shapefiles
+skink.25.dat <- tibble::as_tibble(skink.25@data) %>% unique()
+readr::write_csv(skink.25.dat,"Results/skink_25_intersect.csv")
+
+#extract the richness values per cell
+sum.skink.25 <- skink.25.dat %>%
+  dplyr::group_by(FID_1.1) %>%
+  dplyr::summarize(richness = dplyr::n())
+readr::write_csv(sum.skink.25, "Results/richness_25.csv")
+
+#extract elevation range and mean elevation per species from DEM
+png.dem <- raster::projectRaster(png.dem, crs = behrmann.p)
+sp.vals <- raster::extract(png.dem, skink.dis)
+names(sp.vals) <- names(skink.dis)
+sp.mean <- sapply(sp.vals, FUN = mean, na.rm = T, USE.NAMES = T)
+sp.min <- sapply(sp.vals, FUN = min, na.rm = T, USE.NAMES = T)
+sp.max <- sapply(sp.vals, FUN = max, na.rm = T, USE.NAMES = T)
+sp_alt <- tibble::tibble(Species = names(skink.dis),
+                         mean_alt = sp.mean,
+                         alt_range = sp.max - sp.min)
+```
+
+### Species Pairs
+In this section we identify all possible species pairs in the dataset, as well as all the species pairs that exist in each individual cell in the grid.
+
+```{r pairs, message=FALSE, warning=FALSE, include = FALSE}
+#find all unique pairwise combinations of the species in the dataset
+comb.sp <- combn(unique(skink.25.dat$Mapfile), 2, simplify = T)
+sp.pairs <- character(0)
+i = 1
+while (i <= length(comb.sp)){
+  sp.pairs[length(sp.pairs)+1] <- paste(comb.sp[[i]], comb.sp[[i+1]], sep = "_and_")
+  lares::statusbar(run = i, max.run = length(comb.sp))
+  i = i + 2
+}
+df <- tibble::tibble(sp.pairs)
+df <- df %>% tidyr::separate(sp.pairs, c("sp1", "sp2"), "_and_")
+pairs.all <- tibble::tibble(sp.pairs, df$sp1, df$sp2)
+names(pairs.all) <- c("pair", "sp1", "sp2")
+
+readr::write_csv(pairs.all, "Results/pairs_all.csv")
+
+#find all unique pairwise combinations of the species in each cell
+cells <- as.character(unique(skink.25.dat$FID_1.1))
+
+IDs <- list()
+pair.names <- list()
+k = 1
+while (k <= length(sp.pairs)){
+  ID <- character(0)
+  for (i in 1:length(cells)){
+    new.dat <- subset(skink.25.dat, FID_1.1 == cells[i])
+    if (is.element(df$sp1[k], new.dat$Mapfile)) {
+      if (is.element(df$sp2[k], new.dat$Mapfile)) {
+        ID[length(ID)+1] <- cells[i]
+      }
+    }
+  }
+  IDs[[k]] <- ID
+  pair.names[[k]] <- rep(sp.pairs[k], each = length(ID))
+  lares::statusbar(run = k, max.run = length(sp.pairs))
+  k = k + 1
+}
+pairs.25 <- tibble::tibble(ID = as.numeric(unlist(IDs)),
+                           pairs = unlist(pair.names)) %>%
+  dplyr::arrange(ID)
+
+readr::write_csv(pairs.25, "Results/pairs_per_cell_25.csv")
+```
+
+## Analyses
+### PCA
+In this section we run a PCA on the morphometric measurements of PNG skinks.
+
+```{r pca, message=FALSE, warning=FALSE, include = FALSE}
+#prepare the data for PCA, and create a vector of the species for each sample
+dplyr::glimpse(dat)
+species <- levels(as.factor(dat$Species))
+dat.sub <- dat[, 3:18]
+dat.sub <- dplyr::mutate_at(dat.sub, dplyr::vars(-SVL), ~.x/SVL)
+dat.sp <- data.frame(dat)[, 1]
+
+#run PCA
+dat.pca <- stats::prcomp(dat.sub, center = T, scale. = T)
+print(dat.pca) #return loadings of the variables on all PCs
+summary(dat.pca) #importance of components
+
+#create dataframe of PC scores per sample with associated elevation data and species identity
+skink.pca <- tibble::as_tibble(dat.pca$x[,1:2])
+skink.pca$sp <- dat.sp
+skink.pca$specimen <- data.frame(dat)[,2]
+readr::write_csv(skink.pca, "Results/skink_pca.csv")
+```
+
+### Volumes
+In this section we first calculate the volume of morphospace occupied by each species in the dataset, and then we calculate the pairwise distances, overlaps and unique components between all possible species pairs. We then calculate the mean pairwise overlap and distance per species and per cell, as well as the mean volume per species in each cell, and the total volume of morphospace occupied by all the species in each cell.
+
+```{r overlap, message=FALSE, warning=FALSE, include = FALSE}
+#calculate the volumes per species
+vol.list <- list()
+i = 1
+while (i <= length(species)){
+  new.dat <- skink.pca %>% subset(sp == species[i])
+  vol.list[[i]] <- hypervolume::hypervolume_gaussian(data = new.dat[,1:2],
+                                                     name = species[i],
+                                                     verbose = F)
+  lares::statusbar(run = i, max.run = length(species))
+  i = i + 1
+}
+names(vol.list) <- species
+
+#join the volumes into a HypervolumeList
+vol.sp <- hypervolume::hypervolume_join(vol.list)
+
+#save the volumes of each species in a named vector
+vol.sp2 <- numeric()
+i = 1
+while (i <= length(vol.list)){
+  vol.sp2[[i]] <- vol.list[[i]]@Volume
+  lares::statusbar(run = i, max.run = length(vol.list))
+  i = i + 1
+}
+names(vol.sp2) <- names(vol.list)
+readr::write_csv(tibble::enframe(vol.sp2), "Results/volumes_species.csv")
+
+#calculate pairwise distances, intersects and unique components between all species pairs
+pairs <- pairs.all$pair
+dist.list <- numeric()
+jaccard <- numeric()
+i = 1
+while (i <= length(pairs.all$pair)){
+  new.dat <- pairs.all %>% subset(pair == pairs[i])
+  dist.list[[i]] <- hypervolume::hypervolume_distance(vol.sp[[new.dat$sp1]],
+                                                      vol.sp[[new.dat$sp2]],
+                                                      type = 'centroid')
+  overlap.stat <-hypervolume::hypervolume_overlap_statistics(hypervolume::hypervolume_set(vol.sp[[new.dat$sp1]], vol.sp[[new.dat$sp2]], check.memory = F, verbose = F))
+  jaccard[[i]] <- overlap.stat[1]
+  lares::statusbar(run = i, max.run = length(pairs.all$pair))
+  i = i + 1
+}
+
+names(dist.list) <- pairs
+names(jaccard) <- pairs
+readr::write_csv(tibble::enframe(dist.list), "Results/distances_list.csv")
+readr::write_csv(tibble::enframe(jaccard), "Results/jaccard_list.csv")
+
+#find mean pairwise overlap and mean pairwise distance per species
+pairs.sp1 <- pairs.all[, 1:2]
+names(pairs.sp1) <- c("pair", "species")
+pairs.sp2 <- pairs.all[, c(1, 3)]
+names(pairs.sp2) <- c("pair", "species")
+pairs.sp <- rbind(pairs.sp1, pairs.sp2)
+
+mean.sp.dist <- numeric()
+mean.sp.jaccard <- numeric()
+i = 1
+while (i <= length(unique(pairs.sp$species))){
+  new.dat <- pairs.sp %>% subset(species == unique(pairs.sp$species)[i])
+  test.pairs <- new.dat$pair
+  mean.sp.dist[[i]] <- mean(dist.list[which(names(dist.list) %in% test.pairs)])
+  mean.sp.jaccard[[i]] <- mean(jaccard[which(names(jaccard) %in% test.pairs)])
+  lares::statusbar(run = i, max.run = length(unique(pairs.sp$species)))
+  i = i + 1
+}
+names(mean.sp.dist) <- unique(pairs.sp$species)
+names(mean.sp.jaccard) <- unique(pairs.sp$species)
+readr::write_csv(tibble::enframe(mean.sp.dist),
+                 "Results/mean_pairwise_distance_species.csv")
+readr::write_csv(tibble::enframe(mean.sp.jaccard),
+                 "Results/mean_pairwise_jaccard_species.csv")
+
+#find mean pairwise intersect, mean pairwise distance, centroid, total volume of morphospace and mean morphospace per cell
+cells <- as.character(unique(pairs.25$ID))
+
+mean.cell.dist <- numeric()
+mean.cell.jaccard <- numeric()
+cell.vol <- numeric()
+cell.sp.vol <- numeric()
+centroid_PC1 <- numeric()
+centroid_PC2 <- numeric()
+i = 1
+while (i <= length(cells)){
+  new.dat <- pairs.25 %>% subset(ID == cells[i])
+  test.pairs <- new.dat$pairs
+  mean.cell.dist[[i]] <- mean(dist.list[which(names(dist.list) %in% test.pairs)]) #calculate mean distance
+  mean.cell.jaccard[[i]] <- mean(jaccard[which(names(jaccard) %in% test.pairs)]) #calculate mean jaccard
+  new.dat2 <- skink.25.dat %>% subset(FID_1.1 == cells[i])
+  new.pca.dat <- skink.pca[which(skink.pca$sp %in% new.dat2$Mapfile), ]
+  vol <- hypervolume::hypervolume_gaussian(data = new.pca.dat[,1:2],
+                                           verbose = F) #calculate total volume
+  cell.vol[[i]] <- vol@Volume
+  centroid_PC1[[i]] <- hypervolume::get_centroid(vol)[1]
+  centroid_PC2[[i]] <- hypervolume::get_centroid(vol)[2]
+  cell.sp.vol[[i]] <- mean(vol.sp2[which(names(vol.sp2) %in% new.dat2$Mapfile)]) #calculate mean volume
+  lares::statusbar(run = i, max.run = length(cells))
+  i = i + 1
+}
+
+items_n <- c("mean.cell.dist",
+             "mean.cell.jaccard",
+             "cell.vol",
+             "cell.sp.vol",
+             "centroid_PC1",
+             "centroid_PC2")
+items <- structure(lapply(items_n, get), .Names = items_n)
+named <- lapply(items, structure, .Names = cells)
+list2env(named, .GlobalEnv)
+
+readr::write_csv(tibble::enframe(mean.cell.dist),
+                 "Results/mean_pairwise_distance_cells_25.csv")
+readr::write_csv(tibble::enframe(mean.cell.jaccard),
+                 "Results/mean_pairwise_jaccard_cells_25.csv")
+readr::write_csv(tibble::enframe(cell.vol),
+                 "Results/volumes_cells_25.csv")
+readr::write_csv(tibble::enframe(cell.sp.vol),
+                 "Results/volumes_mean_cells_25.csv")
+readr::write_csv(tibble::enframe(centroid_PC1),
+                 "Results/centroids_PC1_cells_25.csv")
+readr::write_csv(tibble::enframe(centroid_PC2),
+                 "Results/centroids_PC2_cells_25.csv")
+```
+
+### Randomisations of skink assemblages
+In this section we create random skink assemblages while maintaining observed species richness values. We then calculate morphometric measurements for each randomised assemblage.
+
+```{r randomisation, message=FALSE, warning=FALSE}
+#generate a dataframe of species to sample and sampling probability (number of cells in which species occurs)
+sp_pool <- skink.25.dat %>%
+  dplyr::group_by(Mapfile) %>%
+  dplyr::summarise(count = dplyr::n())
+
+#for each observed richness value, sample 100 random assemblages from the species pool
+rich.vals <- sort(unique(sum.skink.25$richness))
+rand <- list()
+set.seed(42)
+for (i in 1:length(rich.vals)){
+  rand.vec <- list()
+  for (k in 1:100){
+    rand.vec[[k]] <- sample(x = as.character(sp_pool$Mapfile),
+                            size = rich.vals[i],
+                            replace = F,
+                            prob = sp_pool$count)
+  }
+  rand[[i]] <- rand.vec
+}
+names(rand) <- rich.vals
+saveRDS(rand, "Results/random_assemblages.RDS")
+
+#generate a table of species in each richness value in each random sample
+rand_i <- tibble::as_tibble(reshape2::melt(rand))
+names(rand_i) <- c("Mapfile", "sample", "richness")
+rand_i$richness <- as.integer(rand_i$richness)
+
+#find all species pairs in each richness value in each random sample
+richness_pool <- unique(rand_i$richness)
+sample_pool <- unique(rand_i$sample)
+richness_rand <- list()
+sample_rand <- list()
+pair.names_rand <- list()
+
+k = 1
+while (k <= length(sp.pairs)){
+  richness_k <- character(0)
+  sample_k <- character(0)
+  for (j in 1:length(richness_pool)){
+    for (m in 1:length(sample_pool)){
+      new.dat <- dplyr::filter(rand_i, richness == richness_pool[j], sample == sample_pool[m])
+      if (is.element(df$sp1[k], new.dat$Mapfile)) {
+        if (is.element(df$sp2[k], new.dat$Mapfile)) {
+          richness_k[length(richness_k)+1] <- richness_pool[j]
+          sample_k[length(sample_k)+1] <- sample_pool[m]
+        }
+      }
+    }
+  }
+  richness_rand[[k]] <- richness_k
+  sample_rand[[k]] <- sample_k
+  pair.names_rand[[k]] <- rep(sp.pairs[k], each = length(richness_k))
+  lares::statusbar(run = k, max.run = length(sp.pairs))
+  k = k + 1
+}
+pairs.25.rand <- tibble::tibble(as.numeric(unlist(richness_rand)), as.numeric(unlist(sample_rand)), unlist(pair.names_rand))
+names(pairs.25.rand) <- c("richness","sample","pairs")
+
+#calculate total volume and PC centroids for each random assemblage
+cell.vol.rand <- numeric(0)
+centroid_PC1.rand <- numeric(0)
+centroid_PC2.rand <- numeric(0)
+
+k = 1
+while (k <= length(richness_pool)){
+  j = 1
+  while (j <= length(sample_pool)){
+    new.dat <- pairs.25.rand %>% dplyr::filter(richness == richness_pool[k], sample == sample_pool[j])
+    test.pairs <- new.dat$pairs
+    new.dat2 <- rand_i %>% dplyr::filter(richness == richness_pool[k], sample == sample_pool[j])
+    new.pca.dat <- skink.pca[which(skink.pca$sp %in% new.dat2$Mapfile), ]
+    vol <- hypervolume::hypervolume_gaussian(data = new.pca.dat[,1:2], verbose = F) #calculate total volume
+    cell.vol.rand[length(cell.vol.rand)+1] <- vol@Volume
+    centroid_PC1.rand[length(centroid_PC1.rand)+1] <- hypervolume::get_centroid(vol)[1]
+    centroid_PC2.rand[length(centroid_PC2.rand)+1] <- hypervolume::get_centroid(vol)[2]
+    j = j + 1
+  }
+  lares::statusbar(run = k, max.run = length(richness_pool))
+  k = k + 1
+}
+
+#summarise for each richness value in each random sample the mean volume, total volume, distnace, overlap and PC centroids
+pairs.25.rand <- pairs.25.rand %>%
+  dplyr::arrange(sample, richness) %>%
+  dplyr::left_join(tibble::enframe(dist.list, name = "pairs", value = "dist"), by = c("pairs")) %>%
+  dplyr::left_join(tibble::enframe(jaccard, name = "pairs", value = "jaccard"), by = c("pairs"))
+
+rand_i <- dplyr::left_join(rand_i, tibble::enframe(vol.sp2, name = "Mapfile", value = "volume"), by = c("Mapfile")) %>%
+  dplyr::arrange(sample, richness)
+
+pairs.25.rand.sum <- pairs.25.rand %>%
+  dplyr::group_by(richness, sample) %>%
+  dplyr::summarise(distance = mean(dist),
+                   jaccard = mean(jaccard)) %>%
+  tibble::add_column(mean_vol = dplyr::summarise(dplyr::group_by(rand_i, richness, sample),
+                                                 mean(volume))$`mean(volume)`)  %>%
+  tibble::add_column(tot_vol = cell.vol.rand) %>%
+  tibble::add_column(PC1_centroid = centroid_PC1.rand) %>%
+  tibble::add_column(PC2_centroid = centroid_PC2.rand)
+
+readr::write_csv(pairs.25.rand.sum, "Results/random_cells.csv")
+```
+
+### Spatial Analyses of morphospace
+In this section we examine the correlations between the various morphospace metrics we calculated in the previous sections, and the spatial predictor variables in PNG (mean elevation and skink richness).
+
+```{r spatial analyses, message=FALSE, warning=FALSE, include = FALSE}
+#create vector of cells
+cells <- as.character(sort(unique(skink.25.dat$FID_1.1)))
+
+#calculate distribution parameters of PC scores for each cell
+bin.25 <- tibble::tibble(ID = cells,
+                         PC1_mode = double(length = length(cells)),
+                         PC1_kurtosis = double(length = length(cells)),
+                         PC1_sd = double(length = length(cells)),
+                         PC1_skewness = double(length = length(cells)),
+                         PC2_mode = double(length = length(cells)),
+                         PC2_kurtosis = double(length = length(cells)),
+                         PC2_sd = double(length = length(cells)),
+                         PC2_skewness = double(length = length(cells))
+)
+
+i = 1
+while (i <= length(cells)){
+  new.dat <- skink.25.dat %>% subset(FID_1.1 == cells[i])
+  new.pca.dat <- skink.pca[which(skink.pca$sp %in% new.dat$Mapfile), ]
+  bin.25[i,2] <- mode(new.pca.dat$PC1)
+  bin.25[i,3] <- e1071::kurtosis(new.pca.dat$PC1)
+  bin.25[i,4] <- sd(new.pca.dat$PC1)
+  bin.25[i,5] <- e1071::skewness(new.pca.dat$PC1)
+  bin.25[i,6] <- mode(new.pca.dat$PC2)
+  bin.25[i,7] <- e1071::kurtosis(new.pca.dat$PC2)
+  bin.25[i,8] <- sd(new.pca.dat$PC2)
+  bin.25[i,9] <- e1071::skewness(new.pca.dat$PC2)
+  lares::statusbar(run = i, max.run = length(cells))
+  i = i + 1
+}
+
+readr::write_csv(bin.25, "Results/bin_25.csv")
+
+all.25.pca <- dplyr::full_join(skink.25.dat,
+                               skink.pca,
+                               by = c("Mapfile" = "sp")) %>% tidyr::drop_na(FID_1.1)
+
+#reduce the full dataset to only include one row of each cell
+skink.25.dat.r <- skink.25.dat %>% dplyr::group_by(FID_1.1) %>% dplyr::slice(1L)
+
+#Combine all the response and predictor variables into a single object
+dat.25 <- tibble::tibble(ID = skink.25.dat.r$FID_1.1,
+                         lat = skink.25.dat.r$lat,
+                         long = skink.25.dat.r$long,
+                         distance = mean.cell.dist,
+                         jaccard = mean.cell.jaccard,
+                         tot_vol = cell.vol,
+                         mean_vol = cell.sp.vol,
+                         richness = sum.skink.25$richness,
+                         mean_alt = skink.25.dat.r$mean_alt_u,
+                         alt_range = skink.25.dat.r$alt_range_,
+                         mean_prec = skink.25.dat.r$mean_prec_,
+                         mean_temp = skink.25.dat.r$ma_temp_un,
+                         npp = skink.25.dat.r$mean_npp_u,
+                         PC1_mode = bin.25$PC1_mode,
+                         PC2_mode = bin.25$PC2_mode,
+                         PC1_kurtosis = bin.25$PC1_kurtosis,
+                         PC2_kurtosis = bin.25$PC2_kurtosis,
+                         PC1_centroid = centroid_PC1,
+                         PC2_centroid = centroid_PC2,
+                         PC1_sd = bin.25$PC1_sd,
+                         PC2_sd = bin.25$PC2_sd,
+                         PC1_skewness = bin.25$PC1_skewness,
+                         PC2_skewness = bin.25$PC2_skewness)
+
+#define "breakpoint between highland and lowland
+lin.mod <- lm(richness ~ mean_alt, dat.25)
+segmented.mod <- segmented::segmented(lin.mod, seg.Z = ~mean_alt, psi=1000)
+
+#create column of elevation categories
+dat.25$alt_cat <- dplyr::case_when(dat.25$mean_alt < segmented.mod$psi[2] ~ "Lowland",
+                                   dat.25$mean_alt > segmented.mod$psi[2] ~ "Highland")
+
+readr::write_csv(dat.25, "Results/dat_25.csv")
+
+#generate elevation categories per species
+sp_alt <- sp_alt %>%
+  dplyr::mutate(alt_cat = dplyr::case_when(sp_alt$mean_alt < segmented.mod$psi[2] ~ "Lowland",
+                                           sp_alt$mean_alt > segmented.mod$psi[2] ~ "Highland"))
+dat <- dplyr::left_join(dat, sp_alt) %>%
+  dplyr::select(-c(mean_alt, alt_range))
+dat.alt <- dat$alt_cat
+
+#Get individuals (observations) as a matrix of PC scores
+tab <- matrix(c(dat.pca$x[,1], dat.pca$x[,2]), ncol=2)
+#Calculate ellipses
+ellipse_low <- car::dataEllipse(tab[which(dat.alt == "Lowland"),1],
+                                tab[which(dat.alt == "Lowland"),2],
+                                levels = 0.95)
+ellipse_high <- car::dataEllipse(tab[which(dat.alt == "Highland"),1],
+                                 tab[which(dat.alt == "Highland"),2],
+                                 levels = 0.95)
+#Calculate areas of ellipses
+me_low <- apply(tab[which(dat.alt == "Lowland"),], 2, mean)
+dist2center_low <- sqrt(rowSums((t(t(ellipse_low)-me_low))^2))
+area_low <- pi*min(dist2center_low)*max(dist2center_low)
+me_high <- apply(tab[which(dat.alt == "Highland"),], 2, mean)
+dist2center_high <- sqrt(rowSums((t(t(ellipse_high)-me_low))^2))
+area_high <- pi*min(dist2center_high)*max(dist2center_high)
+
+#run PERMANOVA on full PCA data
+dat_c <- scale(dat.pca$x[, 1:2])
+dat_pca <- tibble::tibble(dat.pca$x)
+dat_pca$alt <- dat$alt_cat
+vegan::adonis(dat_c ~ alt, data = dat_pca, method='eu')
+
+#run PERMANOVA on PC centroids of cells
+dat_c <- scale(dat.25[, 12:13])
+vegan::adonis(dat_c ~ alt_cat, data = dat.25, method='eu')
+
+#run scaled GAM models for each morphospace metric, with model selection based on AICc scores and calculation of relative importance of predictors
+#then run scaled GAM with randomised assemblages and compare observed coefficients with distribution of random coefficients to generate p-values
+
+##mean volume
+full_model <- mgcv::gam(scale(mean_vol) ~
+                          scale(richness) +
+                          scale(mean_alt) +
+                          s(long, lat, k = 100),
+                        data = dat.25,
+                        na.action = "na.fail")
+mgcv::concurvity(full_model)
+selection_info <- MuMIn::dredge(full_model)
+best_model.meanvol <- MuMIn::get.models(selection_info, subset = T)[[1]]
+selection_info
+summary(best_model.meanvol)
+print(stats::cor(stats::predict(best_model.meanvol), dat.25$mean_vol))
+if(best_model.meanvol$terms > 2){
+  relaimpo::calc.relimp(best_model.meanvol, type = c("lmg"), rela = TRUE)
+}
+
+rand_dist.meanvol_alt <- pairs.25.rand.sum %>%
+  dplyr::left_join(dplyr::select(dat.25, c(richness, mean_alt, lat, long)), by = "richness") %>%
+  dplyr::group_by(sample) %>%
+  dplyr::group_modify(~ broom::tidy((mgcv::gam(scale(mean_vol) ~
+                                                 scale(mean_alt) +
+                                                 s(long, lat, k = 100), 
+                                               data = .x,
+                                               na.action = "na.fail"))$coefficients)) %>%
+  dplyr::filter(names == "scale(mean_alt)") %>%
+  dplyr::pull(x)
+p.meanvol_alt <- length(which(abs(rand_dist.meanvol_alt) >= abs(best_model.meanvol$coefficients[[2]])))/length(rand_dist.meanvol_alt)
+
+rich_model.meanvol <- mgcv::gam(scale(mean_vol) ~
+                                  scale(richness) +
+                                  s(long, lat, k = 100),
+                                data = dat.25,
+                                na.action = "na.fail")
+rand_dist.meanvol_richness <- pairs.25.rand.sum %>%
+  dplyr::left_join(dplyr::select(dat.25, c(richness, mean_alt, lat, long)), by = "richness") %>%
+  dplyr::group_by(sample) %>%
+  dplyr::group_modify(~ broom::tidy((mgcv::gam(scale(mean_vol) ~
+                                                 scale(richness) +
+                                                 s(long, lat, k = 100), 
+                                               data = .x,
+                                               na.action = "na.fail"))$coefficients)) %>%
+  dplyr::filter(names == "scale(richness)") %>%
+  dplyr::pull(x)
+p.meanvol_richness <- length(which(abs(rand_dist.meanvol_richness) >= abs(rich_model.meanvol$coefficients[[2]])))/length(rand_dist.meanvol_richness)
+
+##total volume
+full_model <- mgcv::gam(scale(tot_vol) ~
+                          scale(richness) +
+                          scale(mean_alt) +
+                          s(long, lat, k = 100),
+                        data = dat.25,
+                        na.action = "na.fail")
+mgcv::concurvity(full_model)
+selection_info <- MuMIn::dredge(full_model)
+best_model.totvol <- MuMIn::get.models(selection_info, subset = T)[[1]]
+selection_info
+summary(best_model.totvol)
+print(stats::cor(stats::predict(best_model.totvol), dat.25$tot_vol))
+if(best_model.totvol$terms > 2){
+  relaimpo::calc.relimp(best_model.totvol, type = c("lmg"), rela = TRUE)
+}
+
+rand_dist.totvol_alt <- pairs.25.rand.sum %>%
+  dplyr::left_join(dplyr::select(dat.25, c(richness, mean_alt, lat, long)), by = "richness") %>%
+  dplyr::group_by(sample) %>%
+  dplyr::group_modify(~ broom::tidy((mgcv::gam(scale(tot_vol) ~
+                                                 scale(mean_alt) +
+                                                 scale(richness) +
+                                                 s(long, lat, k = 100), 
+                                               data = .x,
+                                               na.action = "na.fail"))$coefficients)) %>%
+  dplyr::filter(names == "scale(mean_alt)") %>%
+  dplyr::pull(x)
+p.totvol_alt <- length(which(abs(rand_dist.totvol_alt) >= abs(best_model.totvol$coefficients[[2]])))/length(rand_dist.totvol_alt)
+rand_dist.totvol_richness <- pairs.25.rand.sum %>%
+  dplyr::left_join(dplyr::select(dat.25, c(richness, mean_alt, lat, long)), by = "richness") %>%
+  dplyr::group_by(sample) %>%
+  dplyr::group_modify(~ broom::tidy((mgcv::gam(scale(tot_vol) ~
+                                                 scale(mean_alt) +
+                                                 scale(richness) +
+                                                 s(long, lat, k = 100), 
+                                               data = .x,
+                                               na.action = "na.fail"))$coefficients)) %>%
+  dplyr::filter(names == "scale(richness)") %>%
+  dplyr::pull(x)
+p.totvol_richness <- length(which(abs(rand_dist.totvol_richness) >= abs(best_model.totvol$coefficients[[3]])))/length(rand_dist.totvol_richness)
+
+##mean distance
+full_model <- mgcv::gam(scale(distance) ~
+                          scale(richness) +
+                          scale(mean_alt) +
+                          s(long, lat, k = 100),
+                        data = dat.25,
+                        na.action = "na.fail")
+mgcv::concurvity(full_model)
+selection_info <- MuMIn::dredge(full_model)
+best_model.dist <- MuMIn::get.models(selection_info, subset = T)[[1]]
+selection_info
+summary(best_model.dist)
+print(stats::cor(stats::predict(best_model.dist), dat.25$distance))
+if(best_model.dist$terms > 2){
+  relaimpo::calc.relimp(best_model.dist, type = c("lmg"), rela = TRUE)
+}
+
+rand_dist.dist_alt <- pairs.25.rand.sum %>%
+  dplyr::left_join(dplyr::select(dat.25, c(richness, mean_alt, lat, long)), by = "richness") %>%
+  dplyr::group_by(sample) %>%
+  dplyr::group_modify(~ broom::tidy((mgcv::gam(scale(distance) ~
+                                                 scale(mean_alt) +
+                                                 scale(richness) +
+                                                 s(long, lat, k = 100), 
+                                               data = .x,
+                                               na.action = "na.fail"))$coefficients)) %>%
+  dplyr::filter(names == "scale(mean_alt)") %>%
+  dplyr::pull(x)
+p.dist_alt <- length(which(abs(rand_dist.dist_alt) >= abs(best_model.dist$coefficients[[2]])))/length(rand_dist.dist_alt)
+rand_dist.dist_richness <- pairs.25.rand.sum %>%
+  dplyr::left_join(dplyr::select(dat.25, c(richness, mean_alt, lat, long)), by = "richness") %>%
+  dplyr::group_by(sample) %>%
+  dplyr::group_modify(~ broom::tidy((mgcv::gam(scale(distance) ~
+                                                 scale(mean_alt) +
+                                                 scale(richness) +
+                                                 s(long, lat, k = 100), 
+                                               data = .x,
+                                               na.action = "na.fail"))$coefficients)) %>%
+  dplyr::filter(names == "scale(richness)") %>%
+  dplyr::pull(x)
+p.dist_richness <- length(which(abs(rand_dist.dist_richness) >= abs(best_model.dist$coefficients[[3]])))/length(rand_dist.dist_richness)
+
+##mean overlap
+full_model <- mgcv::gam(scale(jaccard) ~
+                          scale(richness) +
+                          scale(mean_alt) +
+                          s(long, lat, k = 100),
+                        data = dat.25,
+                        na.action = "na.fail")
+mgcv::concurvity(full_model)
+selection_info <- MuMIn::dredge(full_model)
+best_model.jac <- MuMIn::get.models(selection_info, subset = T)[[1]]
+selection_info
+summary(best_model.jac)
+print(stats::cor(stats::predict(best_model.jac), dat.25$jaccard))
+if(best_model.jac$terms > 2){
+  relaimpo::calc.relimp(best_model.jac, type = c("lmg"), rela = TRUE)
+}
+
+rand_dist.jac_alt <- pairs.25.rand.sum %>%
+  dplyr::left_join(dplyr::select(dat.25, c(richness, mean_alt, lat, long)), by = "richness") %>%
+  dplyr::group_by(sample) %>%
+  dplyr::group_modify(~ broom::tidy((mgcv::gam(scale(jaccard) ~
+                                                 scale(mean_alt) +
+                                                 scale(richness) +
+                                                 s(long, lat, k = 100), 
+                                               data = .x,
+                                               na.action = "na.fail"))$coefficients)) %>%
+  dplyr::filter(names == "scale(mean_alt)") %>%
+  dplyr::pull(x)
+p.jac_alt <- length(which(abs(rand_dist.jac_alt) >= abs(best_model.jac$coefficients[[2]])))/length(rand_dist.jac_alt)
+rand_dist.jac_richness <- pairs.25.rand.sum %>%
+  dplyr::left_join(dplyr::select(dat.25, c(richness, mean_alt, lat, long)), by = "richness") %>%
+  dplyr::group_by(sample) %>%
+  dplyr::group_modify(~ broom::tidy((mgcv::gam(scale(jaccard) ~
+                                                 scale(mean_alt) +
+                                                 scale(richness) +
+                                                 s(long, lat, k = 100), 
+                                               data = .x,
+                                               na.action = "na.fail"))$coefficients)) %>%
+  dplyr::filter(names == "scale(richness)") %>%
+  dplyr::pull(x)
+p.jac_richness <- length(which(abs(rand_dist.jac_richness) >= abs(best_model.jac$coefficients[[3]])))/length(rand_dist.jac_richness)
+
+#generate model predictions for plotting purposes:
+plot.meanvol <- mgcv::gam(mean_vol ~
+                            richness +
+                            mean_alt +
+                            s(long, lat, k = 100),
+                          data = dat.25)
+plot.totvol <- mgcv::gam(tot_vol ~
+                           richness +
+                           mean_alt +
+                           s(long, lat, k = 100),
+                         data = dat.25)
+plot.dist <- mgcv::gam(distance ~
+                         richness +
+                         mean_alt +
+                         s(long, lat, k = 100),
+                       data = dat.25)
+plot.jac <- mgcv::gam(jaccard ~
+                        richness +
+                        mean_alt +
+                        s(long, lat, k = 100),
+                      data = dat.25)
+
+richness.plot <- with(dat.25,
+                      expand.grid(richness = seq(min(richness), max(richness), length = 30),
+                                  mean_alt = mean(mean_alt),
+                                  long = mean(long),
+                                  lat = mean(lat)))
+richness.plot$mean_vol <- stats::predict(plot.meanvol, richness.plot)
+err <- stats::predict(plot.meanvol, richness.plot, se = T)
+richness.plot$ucl_meanvol <- err$fit + 1.96*err$se.fit
+richness.plot$lcl_meanvol <- err$fit - 1.96*err$se.fit
+richness.plot$tot_vol <- stats::predict(plot.totvol, richness.plot)
+err <- stats::predict(plot.totvol, richness.plot, se = T)
+richness.plot$ucl_totvol <- err$fit + 1.96*err$se.fit
+richness.plot$lcl_totvol <- err$fit - 1.96*err$se.fit
+richness.plot$distance <- stats::predict(plot.dist, richness.plot)
+err <- stats::predict(plot.dist, richness.plot, se = T)
+richness.plot$ucl_dist <- err$fit + 1.96*err$se.fit
+richness.plot$lcl_dist <- err$fit - 1.96*err$se.fit
+richness.plot$jaccard <- stats::predict(plot.jac, richness.plot)
+err <- stats::predict(plot.jac, richness.plot, se = T)
+richness.plot$ucl_jac <- err$fit + 1.96*err$se.fit
+richness.plot$lcl_jac <- err$fit - 1.96*err$se.fit
+
+mean_alt.plot <- with(dat.25,
+                      expand.grid(mean_alt = seq(min(mean_alt), max(mean_alt), length = 30),
+                                  richness = mean(richness),
+                                  long = mean(long),
+                                  lat = mean(lat)))
+mean_alt.plot$mean_vol <- stats::predict(plot.meanvol, mean_alt.plot)
+err <- stats::predict(plot.meanvol, mean_alt.plot, se = T)
+mean_alt.plot$ucl_meanvol <- err$fit + 1.96*err$se.fit
+mean_alt.plot$lcl_meanvol <- err$fit - 1.96*err$se.fit
+mean_alt.plot$tot_vol <- stats::predict(plot.totvol, mean_alt.plot)
+err <- stats::predict(plot.totvol, mean_alt.plot, se = T)
+mean_alt.plot$ucl_totvol <- err$fit + 1.96*err$se.fit
+mean_alt.plot$lcl_totvol <- err$fit - 1.96*err$se.fit
+mean_alt.plot$distance <- stats::predict(plot.dist, mean_alt.plot)
+err <- stats::predict(plot.dist, mean_alt.plot, se = T)
+mean_alt.plot$ucl_dist <- err$fit + 1.96*err$se.fit
+mean_alt.plot$lcl_dist <- err$fit - 1.96*err$se.fit
+mean_alt.plot$jaccard <- stats::predict(plot.jac, mean_alt.plot)
+err <- stats::predict(plot.jac, mean_alt.plot, se = T)
+mean_alt.plot$ucl_jac <- err$fit + 1.96*err$se.fit
+mean_alt.plot$lcl_jac <- err$fit - 1.96*err$se.fit
+```
+
+### Competitive exclusion and limiting similarity
+In this section we run analyses to see whether, for each species, sympatric assemblages (cells where it occurs) are more or less similar (via metrics of distance and overlap) to it than allopatric assemblages (cells where it doesn't occur)?
+
+```{r assemblages, message=FALSE, warning=FALSE, include = FALSE}
+#create a dataframe where we have the pairwise distance and overlap for each possible pairwise combination of species
+pairs.all.ass <- pairs.all %>% dplyr::mutate(
+  dist = dist.list,
+  jaccard = jaccard) %>%
+  tidyr::gather(key = "no", value = "species", sp1, sp2)
+pairs.all.ass$species <- forcats::as_factor(pairs.all.ass$species)
+
+dist.yes <- numeric()
+dist.no <- numeric()
+dist.t <- numeric()
+dist.p <- numeric()
+jaccard.yes <- numeric()
+jaccard.no <- numeric()
+jaccard.t <- numeric()
+jaccard.p <- numeric()
+
+skink.names <- skink.25.dat %>%
+  dplyr::group_by(Mapfile) %>%
+  dplyr::summarise(count = dplyr::n())
+skink.names <- skink.names$Mapfile
+
+#next we calculate, for each species, the mean distance and overlap for it with each assemblage out of the cells in the dataset. We make this calculation for the "in.group" (cells where the species occurs) and "out.group" (cells where the species doesn't occur). We then run a t-test to compare between the distances and overlaps in the "in.group" and "out.group". We save the p-value, T statistics, and the mean values for the "in.group" and "out.group" for each species.
+for (i in 1:length(levels(pairs.all.ass$species))){
+  pairs.all.ass <- 
+    pairs.all.ass %>%
+    dplyr::mutate(in.group = dplyr::case_when(species == levels(pairs.all.ass$species)[i] ~
+                                                "yes",
+                                              species != levels(pairs.all.ass$species)[i] ~
+                                                "no"))
+  in.group <- pairs.all.ass %>% subset(in.group == "yes")
+  in.group <- pairs.all.ass %>% dplyr::semi_join(in.group, by = "pair")
+  out.group <- in.group %>% subset(in.group == "no")
+  in.group.25 <- pairs.25 %>%
+    dplyr::inner_join(in.group, by = c("pairs" = "pair")) %>%
+    subset(in.group == "yes") %>%
+    dplyr::group_by(ID) %>%
+    dplyr::summarise(dist = mean(dist),
+                     jaccard = mean(jaccard))
+  out.group.ID <- setdiff(unique(pairs.25$ID), unique(in.group.25$ID))
+  out.group.25 <- skink.25.dat %>%
+    subset(Mapfile != levels(pairs.all.ass$species)[i] & 
+             FID_1.1 %in% out.group.ID) %>%
+    dplyr::inner_join(out.group, by = c("Mapfile" = "species")) %>%
+    dplyr::group_by(FID_1.1) %>%
+    dplyr::summarise(dist = mean(dist),
+                     jaccard = mean(jaccard)) %>%
+    dplyr::rename(ID = FID_1.1)
+  if (length(out.group.ID) > 0){
+    t.dist <- stats::t.test(in.group.25$dist, out.group.25$dist)
+    t.jaccard <- stats::t.test(in.group.25$jaccard, out.group.25$jaccard)
+    dist.yes[[i]] <- t.dist$estimate[1]
+    dist.no[[i]] <- t.dist$estimate[2]
+    dist.t[[i]] <- t.dist$statistic
+    dist.p[[i]] <- t.dist$p.value
+    jaccard.yes[[i]] <- t.jaccard$estimate[1]
+    jaccard.no[[i]] <- t.jaccard$estimate[2]
+    jaccard.t[[i]] <- t.jaccard$statistic
+    jaccard.p[[i]] <- t.jaccard$p.value
+  } else {
+    next
+  }
+}
+
+#now we create a summary table of the t-tests, recording for each species whether the t.test was significant or not, and which group ("in.gruop" or "out.group") had the higher mean value.
+species.ass <- tibble::tibble(
+  binomial = levels(pairs.all.ass$species),
+  dist.yes,
+  dist.no,
+  dist.t,
+  dist.p,
+  dist.bigger = dplyr::case_when(
+    dist.yes > dist.no ~ "in.group",
+    dist.yes < dist.no ~ "out.group"
+  ),
+  dist.sig = dplyr::case_when(
+    dist.p < 0.05 ~ "yes",
+    dist.p > 0.05 ~ "no"
+  ),
+  jaccard.yes,
+  jaccard.no,
+  jaccard.t,
+  jaccard.p,
+  jaccard.bigger = dplyr::case_when(
+    jaccard.yes > jaccard.no ~ "in.group",
+    jaccard.yes < jaccard.no ~ "out.group"
+  ),
+  jaccard.sig = dplyr::case_when(
+    jaccard.p < 0.05 ~ "yes",
+    jaccard.p > 0.05 ~ "no"
+  )
+)
+readr::write_csv(species.ass, "Results/species_assemblages.csv")
+
+#which species follow the expected pattern under the hypothesis of competitive exclusion and limiting similarity??
+species.ass.exp <- species.ass %>%
+  subset(dist.sig == "yes" &
+           jaccard.sig == "yes" &
+           dist.bigger == "in.group" &
+           jaccard.bigger == "out.group") #follow expected pattern for both parameters
+species.ass.opp <- species.ass %>%
+  subset(dist.sig == "yes" &
+           jaccard.sig == "yes" &
+           dist.bigger == "out.group" &
+           jaccard.bigger == "in.group") #follow the opposite pattern for both parameters
+species.ass.exp.dist <- species.ass %>%
+  subset(dist.sig == "yes" &
+           dist.bigger == "in.group") #follow the expected pattern for distance only
+species.ass.exp.jaccard <- species.ass %>%
+  subset(jaccard.sig == "yes" &
+           jaccard.bigger == "out.group") #follow the expected pattern for overlap only
+species.ass.exp2 <- species.ass %>%
+  subset(dist.sig == "yes" &
+           dist.bigger == "in.group" |
+           jaccard.sig == "yes" &
+           jaccard.bigger == "out.group") #follow the expected pattern at least for one of the parameters
+species.ass.not.exp <- species.ass %>%
+  subset(binomial %in% setdiff(species.ass$binomial,
+                               species.ass.exp2$binomial)) #don't follow the expected pattern for either parameter
+
+#paired t-test: are distances larger and overlap smaller within ranges than outside?
+species.ass.no_na <- dplyr::left_join(species.ass,
+                                      unique(dplyr::select(dat, Species, alt_cat)),
+                                      by = c("binomial" = "Species"))
+stats::t.test(x = dist.yes,
+              y = dist.no,
+              data = species.ass.no_na,
+              paired = T)
+stats::t.test(x = jaccard.yes,
+              y = jaccard.no,
+              data = species.ass.no_na,
+              paired = T)
+
+#are regression slopes of distances from and overlaps with focal species within and outside their ranges significantly different from 1?
+model_dist <- stats::lm(dist.no ~ dist.yes + 0,
+                        species.ass.no_na)
+car::linearHypothesis(model_dist, "dist.yes = 1")
+
+model_jaccard <- stats::lm(jaccard.no ~ jaccard.yes + 0,
+                           species.ass.no_na)
+car::linearHypothesis(model_jaccard, "jaccard.yes = 1")
+```
+
+### Sensitivity analyses
+In this section we run a few sensitivity analyses to make sure that model assumptions are met, e.g.:
+1. Species richness is decoupled from elevation
+2. Species volume in morphospace is not correlated with sample size, range size, or elevation range.
+We also test to see whether excluded species differ from included species in body size, range size or elevation range.
+
+```{r sensitivity, message=FALSE, warning=FALSE}
+##linear regression and GAM to test for a relationship between elevation and richness
+lm_rich <- lm(richness~mean_alt, dat.25)
+gam_rich <- mgcv::gam(richness~s(mean_alt), method = "REML", data=dat.25)
+
+summary(lm_rich)
+summary(gam_rich)
+
+##linear regressions to test for correlations between per species morphospace volume and body size, range size and elevation range
+#calculate per species range size & create dataframe including all variables to be tested (extracted from previous chunks)
+sp_sns <- skink.pca %>%
+  dplyr::group_by(sp) %>%
+  dplyr::summarise(sample = dplyr::n())
+sp_sns$volume <- vol.sp2
+sp_sns$alt_range <- sp_alt$alt_range
+sp_sns$range_size <- rgeos::gArea(skink.dis, byid = T)/1000000 #calculate range size in km2
+sp_sns$alt_cat <- sp_alt$alt_cat
+sp_sns$mean_alt <- sp_alt$mean_alt
+
+#run log-log linear regression models to test for correlations between each variable and per species morphospace volume (elevation range +1 to allow ranges of 0 to be log-transformed)
+lm_sample <- lm(log10(volume)~log10(sample), sp_sns)
+lm_range <- lm(log10(volume)~log10(range_size), sp_sns)
+lm_alt <- lm(log10(volume)~log10(alt_range + 1), sp_sns)
+
+summary(lm_sample)
+summary(lm_range)
+summary(lm_alt)
+
+##tests to see if excluded species differ from included species
+#load table of all PNG skink species
+sp_all <- readr::read_csv("Data/all_skinks.csv")
+#load shapefiles of excluded species that occur on NG and are mapped
+skink.excl <- maptools::readShapePoly("Data/PNG_skinks_notMeasured")
+wgs84.p <- raster::crs("+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0")
+sp::proj4string(skink.excl) <- wgs84.p
+skink.excl <- sp::spTransform(skink.excl, behrmann.p)
+skink.excl <- rgeos::gBuffer(skink.excl, byid = TRUE, width = 0)
+skink.excl <- raster::intersect(grid.25, skink.excl)
+#extract range sizes  for excluded species
+skink.excl.dis <- maptools::unionSpatialPolygons(skink.excl, IDs = skink.excl@data$Mapfile)
+skink.excl.size <- rgeos::gArea(skink.excl.dis, byid = T)/1000000 #calculate range in km2
+skink.excl.size <- tibble::tibble(sp = names(skink.excl.size),
+                                  range_size = skink.excl.size)
+#extract elevation range and mean elevation for excluded species from DEM
+sp.excl.vals <- raster::extract(png.dem, skink.excl.dis)
+names(sp.excl.vals) <- names(skink.excl.dis)
+sp.excl.mean <- sapply(sp.excl.vals, FUN = mean, na.rm = T, USE.NAMES = T)
+sp.excl.min <- sapply(sp.excl.vals, FUN = min, na.rm = T, USE.NAMES = T)
+sp.excl.max <- sapply(sp.excl.vals, FUN = max, na.rm = T, USE.NAMES = T)
+skink.excl.alt <- tibble::tibble(sp = names(skink.excl.dis),
+                                 mean_alt = sp.excl.mean,
+                                 alt_range = sp.excl.max - sp.excl.min)
+skink.excl.alt$alt_cat <- dplyr::case_when(skink.excl.alt$mean_alt < segmented.mod$psi[2] ~ "Lowland",
+                                           skink.excl.alt$mean_alt > segmented.mod$psi[2] ~ "Highland") #define elevation categories
+
+#create dataframe containing body size, range size, and elevation range for all species
+sp_all <- dplyr::left_join(sp_all, sp_sns) 
+sp_all <- dplyr::left_join(sp_all, skink.excl.size, by = "sp") %>% 
+  dplyr::mutate(range_size = dplyr::coalesce(range_size.x, range_size.y)) %>% 
+  dplyr::select(-range_size.x, -range_size.y)
+sp_all <- dplyr::left_join(sp_all, skink.excl.alt, by = "sp") %>% 
+  dplyr::mutate(alt_range = dplyr::coalesce(alt_range.x, alt_range.y),
+                alt_cat = dplyr::coalesce(alt_cat.x, alt_cat.y),
+                mean_alt = dplyr::coalesce(mean_alt.x, mean_alt.y)) %>% 
+  dplyr::select(-alt_range.x, -alt_range.y, -alt_cat.x, -alt_cat.y, -mean_alt.x, -mean_alt.y)
+
+readr::write_csv(sp_all, "Results/sensitivity_table.csv")
+
+#run t-tests to see if excluded species differ systematically from included species:
+sp_test <- sp_all %>%
+  dplyr::filter(IE == "no",
+                mapped == "yes") %>%
+  dplyr::mutate_if(is.character, as.factor)
+
+t.test(log10(size) ~ included, data = sp_test)
+t.test(log10(range_size) ~ included, data = sp_test)
+t.test(log10(alt_range + 1) ~ included, data = sp_test)
+t.test(log10(mean_alt) ~ included, data = sp_test)
+fisher.test(sp_test$included, sp_test$alt_cat)
+
+##next we run the main GAM models from chunk 8 on the data divided into lowland and highlands subsets, to account for the non-linear relationship between elevation and richness:
+dat.25_low <- dat.25 %>% dplyr::filter(alt_cat == "Lowland")
+dat.25_high <- dat.25 %>% dplyr::filter(alt_cat == "Highland")
+
+#lowlands:
+full_model <- mgcv::gam(scale(mean_vol) ~
+                          scale(richness) +
+                          scale(mean_alt) +
+                          s(long, lat, k = 100),
+                        data = dat.25_low,
+                        na.action = "na.fail")
+mgcv::concurvity(full_model)
+selection_info <- MuMIn::dredge(full_model)
+best_model.meanvol_low <- MuMIn::get.models(selection_info, subset = T)[[1]]
+selection_info
+summary(best_model.meanvol_low)
+print(stats::cor(stats::predict(best_model.meanvol_low), dat.25_low$mean_vol))
+if(best_model.meanvol_low$terms > 2){
+  relaimpo::calc.relimp(best_model.meanvol_low, type = c("lmg"), rela = TRUE)
+}
+
+full_model <- mgcv::gam(scale(tot_vol) ~
+                          scale(richness) +
+                          scale(mean_alt) +
+                          s(long, lat, k = 100),
+                        data = dat.25_low,
+                        na.action = "na.fail")
+mgcv::concurvity(full_model)
+selection_info <- MuMIn::dredge(full_model)
+best_model.totvol_low <- MuMIn::get.models(selection_info, subset = T)[[1]]
+selection_info
+summary(best_model.totvol_low)
+print(stats::cor(stats::predict(best_model.totvol_low), dat.25_low$tot_vol))
+if(best_model.totvol_low$terms > 2){
+  relaimpo::calc.relimp(best_model.totvol_low, type = c("lmg"), rela = TRUE)
+}
+
+full_model <- mgcv::gam(scale(distance) ~
+                          scale(richness) +
+                          scale(mean_alt) +
+                          s(long, lat, k = 100),
+                        data = dat.25_low,
+                        na.action = "na.fail")
+mgcv::concurvity(full_model)
+selection_info <- MuMIn::dredge(full_model)
+best_model.dist_low <- MuMIn::get.models(selection_info, subset = T)[[1]]
+selection_info
+summary(best_model.dist_low)
+print(stats::cor(stats::predict(best_model.dist_low), dat.25_low$distance))
+if(best_model.dist_low$terms > 2){
+  relaimpo::calc.relimp(best_model.dist_low, type = c("lmg"), rela = TRUE)
+}
+
+full_model <- mgcv::gam(scale(jaccard) ~
+                          scale(richness) +
+                          scale(mean_alt) +
+                          s(long, lat, k = 100),
+                        data = dat.25_low,
+                        na.action = "na.fail")
+mgcv::concurvity(full_model)
+selection_info <- MuMIn::dredge(full_model)
+best_model.jac_low <- MuMIn::get.models(selection_info, subset = T)[[1]]
+selection_info
+summary(best_model.jac_low)
+print(stats::cor(stats::predict(best_model.jac_low), dat.25_low$jaccard))
+if(best_model.jac_low$terms > 2){
+  relaimpo::calc.relimp(best_model.jac_low, type = c("lmg"), rela = TRUE)
+}
+
+#highlands:
+full_model <- mgcv::gam(scale(mean_vol) ~
+                          scale(richness) +
+                          scale(mean_alt) +
+                          s(long, lat, k = 100),
+                        data = dat.25_high,
+                        na.action = "na.fail")
+mgcv::concurvity(full_model)
+selection_info <- MuMIn::dredge(full_model)
+best_model.meanvol_high <- MuMIn::get.models(selection_info, subset = T)[[1]]
+selection_info
+summary(best_model.meanvol_high)
+print(stats::cor(stats::predict(best_model.meanvol_high), dat.25_high$mean_vol))
+if(best_model.meanvol_high$terms > 2){
+  relaimpo::calc.relimp(best_model.meanvol_high, type = c("lmg"), rela = TRUE)
+}
+
+full_model <- mgcv::gam(scale(tot_vol) ~
+                          scale(richness) +
+                          scale(mean_alt) +
+                          s(long, lat, k = 100),
+                        data = dat.25_high,
+                        na.action = "na.fail")
+mgcv::concurvity(full_model)
+selection_info <- MuMIn::dredge(full_model)
+best_model.totvol_high <- MuMIn::get.models(selection_info, subset = T)[[1]]
+selection_info
+summary(best_model.totvol_high)
+print(stats::cor(stats::predict(best_model.totvol_high), dat.25_high$tot_vol))
+if(best_model.totvol_high$terms > 2){
+  relaimpo::calc.relimp(best_model.totvol_high, type = c("lmg"), rela = TRUE)
+}
+
+full_model <- mgcv::gam(scale(distance) ~
+                          scale(richness) +
+                          scale(mean_alt) +
+                          s(long, lat, k = 100),
+                        data = dat.25_high,
+                        na.action = "na.fail")
+mgcv::concurvity(full_model)
+selection_info <- MuMIn::dredge(full_model)
+best_model.dist_high <- MuMIn::get.models(selection_info, subset = T)[[1]]
+selection_info
+summary(best_model.dist_high)
+print(stats::cor(stats::predict(best_model.dist_high), dat.25_high$distance))
+if(best_model.dist_high$terms > 2){
+  relaimpo::calc.relimp(best_model.dist_high, type = c("lmg"), rela = TRUE)
+}
+
+full_model <- mgcv::gam(scale(jaccard) ~
+                          scale(richness) +
+                          scale(mean_alt) +
+                          s(long, lat, k = 100),
+                        data = dat.25_high,
+                        na.action = "na.fail")
+mgcv::concurvity(full_model)
+selection_info <- MuMIn::dredge(full_model)
+best_model.jac_high <- MuMIn::get.models(selection_info, subset = T)[[1]]
+selection_info
+summary(best_model.jac_high)
+print(stats::cor(stats::predict(best_model.jac_high), dat.25_high$jaccard))
+if(best_model.jac_high$terms > 2){
+  relaimpo::calc.relimp(best_model.jac_high, type = c("lmg"), rela = TRUE)
+}
+```
+
+## Plots
+In the last section, we generate some of the plots used in the manuscript.
+
+```{r plots,  message=FALSE, warning=FALSE, include = FALSE}
+#PCA plots
+pdf("Plots/PCA/screeplot.pdf", useDingbats = F)
+factoextra::fviz_eig(dat.pca,
+                     addlabels = T)
+dev.off()
+pdf("Plots/PCA/brokenstick.pdf", useDingbats = F)
+eigval_test(dat.pca)#perform and print results of broken stick analysis
+dev.off()
+pdf("Plots/PCA/biplot_all.pdf", useDingbats = F)
+factoextra::fviz_pca_biplot(dat.pca,
+                            repel = T,
+                            label = "var",
+                            axes = c(1, 2))
+dev.off()
+pdf("Plots/PCA/biplot_alt.pdf", useDingbats = F)
+factoextra::fviz_pca_ind(dat.pca,
+                         habillage = dat.alt, # color by groups
+                         addEllipses = TRUE, # Concentration ellipses
+                         ellipse.level = 0.95,
+                         legend.title = "Elevation",
+                         label = "none",
+                         title = NULL,
+                         palette = c("#0066CC", "#FF9900"),
+                         ggtheme = ggpubr::theme_pubr(legend = "right")
+)
+dev.off()
+
+#plot variable loadings using correlation plots
+pca.load <- dat.pca$rotation
+pca.load[1:16, 3:16] <- 0
+pdf("Plots/PCA/loadings_circles.pdf", useDingbats = F)
+corrplot::corrplot(pca.load,
+                   is.corr = F)
+dev.off()
+pdf("Plots/PCA/loadings_numbers.pdf", useDingbats = F)
+corrplot::corrplot(pca.load,
+                   is.corr = F,
+                   method = "number")
+dev.off()
+
+
+#Plots of linear regressions of distribution parameters (sd, skewness, etc.) of PC scores per cell against elevation
+pdf("Plots/scatter/PC_scatter.pdf", height = 10, width = 20, useDingbats = F)
+dat.25 %>% ggpubr::ggscatter(x = "mean_alt",
+                             y = "PC1_centroid",
+                             add = "reg.line",
+                             conf.int = T) +
+  ggpubr::stat_cor(ggplot2::aes(label = paste(..rr.label.., ..p.label.., sep = "~~~~")),
+                   label.y.npc = .15,
+                   label.x.npc = .8)+
+  ggpubr::stat_regline_equation(ggplot2::aes(label =  paste(..eq.label..)),
+                                formula = dat.25$PC1_centroid ~ scale(dat.25$mean_alt),
+                                label.y.npc = .1,
+                                label.x.npc = .8
+  )
+dat.25 %>% ggpubr::ggscatter(x = "mean_alt",
+                             y = "PC1_sd",
+                             add = "reg.line",
+                             conf.int = T) +
+  ggpubr::stat_cor(ggplot2::aes(label = paste(..rr.label.., ..p.label.., sep = "~~~~")),
+                   label.y.npc = 0.15,
+                   label.x.npc = .8)+
+  ggpubr::stat_regline_equation(ggplot2::aes(label = paste(..eq.label..)),
+                                formula = dat.25$PC1_sd ~ scale(dat.25$mean_alt),
+                                label.y.npc = 0.1,
+                                label.x.npc = .8
+  )
+dat.25 %>% ggpubr::ggscatter(x = "mean_alt",
+                             y = "PC1_skewness",
+                             add = "reg.line",
+                             conf.int = T) +
+  ggpubr::stat_cor(ggplot2::aes(label = paste(..rr.label.., ..p.label.., sep = "~~~~")),
+                   label.y.npc = 0.15,
+                   label.x.npc = .8)+
+  ggpubr::stat_regline_equation(ggplot2::aes(label = paste(..eq.label..)),
+                                formula = dat.25$PC1_skewness ~ scale(dat.25$mean_alt),
+                                label.y.npc = 0.1,
+                                label.x.npc = .8
+  )
+dat.25 %>% ggpubr::ggscatter(x = "mean_alt",
+                             y = "PC1_kurtosis",
+                             add = "reg.line",
+                             conf.int = T) +
+  ggpubr::stat_cor(ggplot2::aes(label = paste(..rr.label.., ..p.label.., sep = "~~~~")),
+                   label.y.npc = 0.15,
+                   label.x.npc = .8)+
+  ggpubr::stat_regline_equation(ggplot2::aes(label = paste(..eq.label..)),
+                                formula = dat.25$PC1_kurtosis ~ scale(dat.25$mean_alt),
+                                label.y.npc = 0.1,
+                                label.x.npc = .8
+  )
+dat.25 %>% ggpubr::ggscatter(x = "mean_alt",
+                             y = "PC2_centroid",
+                             add = "reg.line",
+                             conf.int = T) +
+  ggpubr::stat_cor(ggplot2::aes(label = paste(..rr.label.., ..p.label.., sep = "~~~~")),
+                   label.y.npc = 0.95,
+                   label.x.npc = .8)+
+  ggpubr::stat_regline_equation(ggplot2::aes(label = paste(..eq.label..)),
+                                formula = dat.25$PC2_centroid ~ scale(dat.25$mean_alt),
+                                label.y.npc = 0.9,
+                                label.x.npc = .8
+  )
+dat.25 %>% ggpubr::ggscatter(x = "mean_alt",
+                             y = "PC2_sd",
+                             add = "reg.line",
+                             conf.int = T) +
+  ggpubr::stat_cor(ggplot2::aes(label = paste(..rr.label.., ..p.label.., sep = "~~~~")),
+                   label.y.npc = 0.15,
+                   label.x.npc = .8)+
+  ggpubr::stat_regline_equation(ggplot2::aes(label = paste(..eq.label..)),
+                                formula = dat.25$PC2_sd ~ scale(dat.25$mean_alt),
+                                label.y.npc = 0.1,
+                                label.x.npc = .8
+  )
+dat.25 %>% ggpubr::ggscatter(x = "mean_alt",
+                             y = "PC2_skewness",
+                             add = "reg.line",
+                             conf.int = T) +
+  ggpubr::stat_cor(ggplot2::aes(label = paste(..rr.label.., ..p.label.., sep = "~~~~")),
+                   label.y.npc = 0.15,
+                   label.x.npc = .8)+
+  ggpubr::stat_regline_equation(ggplot2::aes(label = paste(..eq.label..)),
+                                formula = dat.25$PC2_skewness ~ scale(dat.25$mean_alt),
+                                label.y.npc = 0.1,
+                                label.x.npc = .8
+  )
+dat.25 %>% ggpubr::ggscatter(x = "mean_alt",
+                             y = "PC2_kurtosis",
+                             add = "reg.line",
+                             conf.int = T) +
+  ggpubr::stat_cor(ggplot2::aes(label = paste(..rr.label.., ..p.label.., sep = "~~~~")),
+                   label.y.npc = 0.95,
+                   label.x.npc = .8)+
+  ggpubr::stat_regline_equation(ggplot2::aes(label = paste(..eq.label..)),
+                                formula = dat.25$PC2_kurtosis ~ scale(dat.25$mean_alt),
+                                label.y.npc = 0.9,
+                                label.x.npc = .8
+  )
+dev.off()
+
+#scatterplot of PC centroids of cells, grouped by elevation category
+pdf("Plots/Scatter/PCA_altcat_scatterplot.pdf", height = 10, width = 10, useDingbats = F)
+dat.25 %>%
+  ggpubr::ggscatter(x = "PC1_centroid",
+                    y = "PC2_centroid",
+                    color = "alt_cat",
+                    ellipse = T,
+                    mean.point = T,
+                    palette = c("#0066CC", "#FF9900"),
+                    xlab = "PC1 Centroid",
+                    ylab = "PC2 Centroid",
+                    legend.title = "Elevation",
+                    alpha = .5)
+dev.off()
+
+#plot the relationship between richness and elevation, with red vertical lines showing the breakpoint (and confidence intervals)
+pdf("Plots/Scatter/elevation_richness_scatterplot.pdf", height = 5, width = 10, useDingbats = F)
+dat.25 %>%
+  ggpubr::ggscatter(x = "mean_alt",
+                    y = "richness",
+                    xlab = "Mean Elevation (m)",
+                    ylab = "Skink Species Richness") + 
+  ggplot2::geom_smooth(method = "gam",
+                       formula = y~s(x)) +
+  ggplot2::geom_vline(xintercept = confint(segmented.mod)[[1]], color = "red", linetype = "dashed", size = 1) +
+  ggplot2::geom_vline(xintercept = confint(segmented.mod)[[2]], color = "pink", linetype = "dashed", size = 1) +
+  ggplot2::geom_vline(xintercept = confint(segmented.mod)[[3]], color = "pink", linetype = "dashed", size = 1)
+dev.off()
+
+#create a colour palette coded by elevation
+t <- dat.25 %>%
+  ggpubr::ggscatter(x = "PC1_centroid",
+                    y = "PC2_centroid",
+                    color = "mean_alt",
+                    xlab = "PC1 Centroid",
+                    ylab = "PC2 Centroid",
+                    legend.title = "Mean Elevation (m)") +
+  ggpubr::gradient_color(c("#00AFBB", "#E7B800", "#FC4E07"))
+cc <- unlist(ggplot2::ggplot_build(t)$data[1])[1:620]
+cc <- tibble::tibble(ID = dat.25$ID,
+                     cc = cc)
+
+#add the colour per cell to the data
+cc.25 <- dplyr::left_join(dat.25, cc, by = "ID") %>%
+  dplyr::arrange(mean_alt)
+all.25.pca.2 <- dplyr::left_join(all.25.pca, cc.25, by = c("FID_1.1" = "ID"))
+
+#plot histograms of PC scores for each cell coloured by elevation
+pdf("Plots/Scatter/hist_pc1.pdf", height = 2.5, width = 10, useDingbats = F)
+all.25.pca.2 %>%
+  dplyr::arrange(mean_alt.x) %>%
+  ggplot2::ggplot(ggplot2::aes(x = PC1,
+                               fill = as.factor(FID_1.1),
+                               colour = as.factor(FID_1.1))
+  ) +
+  ggplot2::geom_density(fill = NA,
+                        alpha = .1) + 
+  ggplot2::scale_colour_manual(values = as.character(cc.25$cc)) +
+  ggpubr::theme_pubr() +
+  ggplot2::theme(legend.position = "none")
+dev.off()
+
+pdf("Plots/Scatter/hist_pc2.pdf", height = 2.5, width = 10, useDingbats = F)
+all.25.pca.2 %>%
+  dplyr::arrange(mean_alt.x) %>%
+  ggplot2::ggplot(ggplot2::aes(x = PC2,
+                               fill = as.factor(FID_1.1),
+                               colour = as.factor(FID_1.1))
+  ) +
+  ggplot2::geom_density(fill = NA,
+                        alpha = .1) + 
+  ggplot2::scale_colour_manual(values = as.character(cc.25$cc)) +
+  ggpubr::theme_pubr() +
+  ggplot2::theme(legend.position = "none")
+dev.off()
+
+
+#plot GAM model diagnostics
+pdf("Plots/Diagnostics/gam_meanvol.pdf", useDingbats = F)
+par(mfrow=c(2,2))
+mgcv::gam.check(best_model.meanvol)
+dev.off()
+
+pdf("Plots/Diagnostics/gam_totvol.pdf", useDingbats = F)
+par(mfrow=c(2,2))
+mgcv::gam.check(best_model.totvol)
+dev.off()
+
+pdf("Plots/Diagnostics/gam_dist.pdf", useDingbats = F)
+par(mfrow=c(2,2))
+mgcv::gam.check(best_model.dist)
+dev.off()
+
+pdf("Plots/Diagnostics/gam_jac.pdf", useDingbats = F)
+par(mfrow=c(2,2))
+mgcv::gam.check(best_model.jac)
+dev.off()
+
+pdf("Plots/Diagnostics/gam_richness.pdf", useDingbats = F)
+par(mfrow=c(2,2))
+mgcv::gam.check(gam_rich)
+dev.off()
+
+#plot results of randomisations
+metric.names <- c("Mean Pairwise Distance", "Mean Pairwise Jaccard Similarity Coefficient", "Mean Volume", "PC1 Centroid", "PC2 Centroid", "Total Volume")
+names(metric.names) <- c("distance", "jaccard", "mean_vol", "PC1_centroid", "PC2_centroid", "tot_vol")
+
+pdf("Plots/Scatter/randomisations.pdf", useDingbats = F, width = 14)
+pairs.25.rand.sum %>%
+  tidyr::gather("metric", "value", -c(richness, sample)) %>%
+  dplyr::group_by(richness, metric) %>%
+  dplyr::summarise(lwr = quantile(value, .025),
+                   upr = quantile(value, .975),
+                   med = median(value),
+                   mean = mean(value)) %>%
+  ggplot2::ggplot(ggplot2::aes(x = richness)) +
+  ggplot2::geom_point(data = tidyr::gather(dat.25, "metric", "value", c(distance, jaccard, tot_vol, mean_vol, PC1_centroid, PC2_centroid)), ggplot2::aes(x = richness, y = value), colour = "dark grey") +
+  ggplot2::geom_ribbon(ggplot2::aes(ymax = upr, ymin = lwr), fill = "#FF9900", alpha = .5) +
+  ggplot2::geom_line(ggplot2::aes(y = med), colour = "#0066CC", linetype = "dashed", size = 1) +
+  ggplot2::geom_line(ggplot2::aes(y = mean), colour = "black", linetype = "dashed", size = 1) +
+  ggplot2::facet_wrap(ggplot2::vars(metric), scales = "free_y", labeller = ggplot2::labeller(metric = metric.names)) +
+  ggplot2::scale_x_continuous(name = "Skink Species Richness") +
+  ggplot2::scale_y_continuous(name = "") +
+  ggpubr::theme_pubr() +
+  ggplot2::theme(strip.background = ggplot2::element_rect(color="black", fill="white"))
+dev.off()
+
+#plot expected regressions from randomisations with observed regressions from GAM models overlaid on top
+#richness as predictor:
+meanvol_temp <- richness.plot %>%
+  dplyr::select(c(mean_vol, ucl_meanvol, lcl_meanvol, richness)) %>%
+  dplyr::rename(mean = mean_vol,
+                ucl = ucl_meanvol,
+                lcl = lcl_meanvol) %>%
+  tidyr::gather("property", "value") %>%
+  tibble::add_column(metric = "mean_vol")
+
+totvol_temp <- richness.plot %>%
+  dplyr::select(c(tot_vol, ucl_totvol, lcl_totvol, richness)) %>%
+  dplyr::rename(mean = tot_vol,
+                ucl = ucl_totvol,
+                lcl = lcl_totvol) %>%
+  tidyr::gather("property", "value") %>%
+  tibble::add_column(metric = "tot_vol")
+
+dist_temp <- richness.plot %>%
+  dplyr::select(c(distance, ucl_dist, lcl_dist, richness)) %>%
+  dplyr::rename(mean = distance,
+                ucl = ucl_dist,
+                lcl = lcl_dist) %>%
+  tidyr::gather("property", "value") %>%
+  tibble::add_column(metric = "distance")
+
+jac_temp <- richness.plot %>%
+  dplyr::select(c(jaccard, ucl_jac, lcl_jac, richness)) %>%
+  dplyr::rename(mean = jaccard,
+                ucl = ucl_jac,
+                lcl = lcl_jac) %>%
+  tidyr::gather("property", "value") %>%
+  tibble::add_column(metric = "jaccard")
+
+richness.reg <- rbind(meanvol_temp, totvol_temp, dist_temp, jac_temp) %>% 
+  dplyr::group_by_at(dplyr::vars(-value)) %>%  # group by everything other than the value column. 
+  dplyr::mutate(row_id=1:dplyr::n()) %>% dplyr::ungroup() %>%  # build group index
+  tidyr::spread(key=property, value=value) %>%    # spread
+  dplyr::select(-row_id)
+
+pdf("Plots/Scatter/randomisations_lm_richness.pdf", useDingbats = F, height = 4, width = 20)
+pairs.25.rand.sum %>%
+  tidyr::gather("metric", "value", -c(richness, sample)) %>%
+  dplyr::filter(!(metric %in% c("PC1_centroid", "PC2_centroid"))) %>%
+  ggplot2::ggplot(ggplot2::aes(x = richness)) +
+  ggplot2::geom_smooth(ggplot2::aes(group = as.factor(sample), y = value),
+                       colour = "light grey",
+                       se = F,
+                       method = "lm") +
+  ggplot2::geom_point(data = tidyr::gather(dplyr::select(dat.25, -c(PC1_centroid,
+                                                                    PC2_centroid)),
+                                           "metric", "value",
+                                           c(distance, jaccard, tot_vol, mean_vol)),
+                      ggplot2::aes(x = richness, y = value), colour = "black", alpha = 0.5) +
+  ggplot2::geom_smooth(ggplot2::aes(ymin = lcl,
+                                    ymax = ucl,
+                                    y = mean),
+                       size = 1,
+                       data = richness.reg,
+                       stat = "identity",
+                       fill = "light blue") +
+  ggplot2::facet_wrap(ggplot2::vars(metric),
+                      nrow = 1,
+                      scales = "free_y",
+                      labeller = ggplot2::labeller(metric = metric.names)) +
+  ggplot2::scale_x_continuous(name = "Skink Species Richness") +
+  ggplot2::scale_y_continuous(name = "") +
+  ggpubr::theme_pubr() +
+  ggplot2::theme(strip.background = ggplot2::element_rect(color="black", fill="white"),
+                 axis.text = ggplot2::element_text(size = 14),
+                 axis.title = ggplot2::element_text(size = 16),
+                 strip.text = ggplot2::element_text(size = 16))
+dev.off()
+
+#elevation as predictor:
+meanvol_temp <- mean_alt.plot %>%
+  dplyr::select(c(mean_vol, ucl_meanvol, lcl_meanvol, mean_alt)) %>%
+  dplyr::rename(mean = mean_vol,
+                ucl = ucl_meanvol,
+                lcl = lcl_meanvol) %>%
+  tidyr::gather("property", "value") %>%
+  tibble::add_column(metric = "mean_vol")
+
+totvol_temp <- mean_alt.plot %>%
+  dplyr::select(c(tot_vol, ucl_totvol, lcl_totvol, mean_alt)) %>%
+  dplyr::rename(mean = tot_vol,
+                ucl = ucl_totvol,
+                lcl = lcl_totvol) %>%
+  tidyr::gather("property", "value") %>%
+  tibble::add_column(metric = "tot_vol")
+
+dist_temp <- mean_alt.plot %>%
+  dplyr::select(c(distance, ucl_dist, lcl_dist, mean_alt)) %>%
+  dplyr::rename(mean = distance,
+                ucl = ucl_dist,
+                lcl = lcl_dist) %>%
+  tidyr::gather("property", "value") %>%
+  tibble::add_column(metric = "distance")
+
+jac_temp <- mean_alt.plot %>%
+  dplyr::select(c(jaccard, ucl_jac, lcl_jac, mean_alt)) %>%
+  dplyr::rename(mean = jaccard,
+                ucl = ucl_jac,
+                lcl = lcl_jac) %>%
+  tidyr::gather("property", "value") %>%
+  tibble::add_column(metric = "jaccard")
+
+mean_alt.reg <- rbind(meanvol_temp, totvol_temp, dist_temp, jac_temp) %>% 
+  dplyr::group_by_at(dplyr::vars(-value)) %>%  # group by everything other than the value column. 
+  dplyr::mutate(row_id=1:dplyr::n()) %>% dplyr::ungroup() %>%  # build group index
+  tidyr::spread(key=property, value=value) %>%    # spread
+  dplyr::select(-row_id)
+
+pdf("Plots/Scatter/randomisations_lm_elevation.pdf", useDingbats = F, height = 4, width = 20)
+pairs.25.rand.sum %>%
+  dplyr::left_join(dplyr::select(dat.25, c(richness, mean_alt)), by = "richness") %>%
+  tidyr::gather("metric", "value", -c(mean_alt, richness, sample)) %>%
+  dplyr::filter(!(metric %in% c("PC1_centroid", "PC2_centroid"))) %>%
+  ggplot2::ggplot(ggplot2::aes(x = mean_alt)) +
+  ggplot2::geom_smooth(ggplot2::aes(group = as.factor(sample), y = value),
+                       colour = "light grey",
+                       se = F,
+                       method = "lm") +
+  ggplot2::geom_point(data = tidyr::gather(dplyr::select(dat.25, -c(PC1_centroid,
+                                                                    PC2_centroid)),
+                                           "metric", "value",
+                                           c(distance, jaccard, tot_vol, mean_vol)),
+                      ggplot2::aes(x = mean_alt, y = value), colour = "black", alpha = 0.5) +
+  ggplot2::geom_smooth(ggplot2::aes(ymin = lcl,
+                                    ymax = ucl,
+                                    y = mean),
+                       size = 1,
+                       data = mean_alt.reg,
+                       stat = "identity",
+                       fill = "light blue") +
+  ggplot2::facet_wrap(ggplot2::vars(metric),
+                      nrow = 1,
+                      scales = "free_y",
+                      labeller = ggplot2::labeller(metric = metric.names)) +
+  ggplot2::scale_x_continuous(name = "Mean Elevation") +
+  ggplot2::scale_y_continuous(name = "") +
+  ggpubr::theme_pubr() +
+  ggplot2::theme(strip.background = ggplot2::element_rect(color="black", fill="white"),
+                 axis.text = ggplot2::element_text(size = 14),
+                 axis.title = ggplot2::element_text(size = 16),
+                 strip.text = ggplot2::element_text(size = 16))
+dev.off()
+
+#linear regression plots through the origin of distances from and overlaps with focal species within and outside their ranges
+pdf("Plots/Scatter/distance_scatterplot.pdf", height = 7, width = 8, useDingbats = F)
+species.ass.no_na %>% ggpubr::ggscatter("dist.yes",
+                                        "dist.no",
+                                        color = "dist.sig",
+                                        ggtheme = ggpubr::theme_pubr(),
+                                        xlab = "Mean Distance from Focal Species Within Range",
+                                        ylab = "Mean Distance from Focal Species Outside Range",
+                                        legend.title = "Siginificant Difference in Mean Distance?"
+) +
+  ggplot2::geom_abline(intercept = 0,
+                       slope = 1,
+                       linetype = "dashed") +
+  ggplot2::geom_smooth(method = lm,
+                       se = T,
+                       formula = y ~ x + 0)
+dev.off()
+
+
+pdf("Plots/Scatter/jaccard_scatterplot.pdf", height = 7, width = 8, useDingbats = F)
+species.ass.no_na %>% ggpubr::ggscatter("jaccard.yes",
+                                        "jaccard.no",
+                                        color = "jaccard.sig",
+                                        ggtheme = ggpubr::theme_pubr(),
+                                        xlab = "Mean Jaccard Similarity with Focal Species Within Range",
+                                        ylab = "Mean Jaccard Similarity with Focal Species Outside Range",
+                                        legend.title = "Siginificant Difference in Mean Jaccard Similarity?"
+) +
+  ggplot2::geom_abline(intercept = 0,
+                       slope = 1,
+                       linetype = "dashed") +
+  ggplot2::geom_smooth(method = lm,
+                       se = T,
+                       formula = y ~ x + 0)
+dev.off()
+
+#plot results of sensitivity analyses
+param.names <- c("Elevation Range (m)", "Mean Elevation (m)", "Range Size (km2)", "Sample Size", "Mass(g)")
+names(param.names) <- c("alt_range", "mean_alt", "range_size", "sample", "size")
+
+pdf("Plots/Diagnostics/sensitivity_exclusion.pdf", useDingbats = F)
+sp_test %>%
+  dplyr::select(-c(sample, volume)) %>%
+  dplyr::mutate(alt_range = alt_range + 1) %>%
+  tidyr::gather(key = "parameter",
+                value = "value",
+                -c(sp, included, IE, mapped, alt_cat)) %>%
+  ggpubr::ggboxplot(x = "included",
+                    y = "value",
+                    fill = "included",
+                    xlab = F,
+                    ylab = F,
+                    legend.title = "Species") +
+  ggplot2::facet_wrap(ggplot2::vars(parameter),
+                      scales = "free_y",
+                      labeller = ggplot2::labeller(parameter = param.names)) +
+  ggplot2::scale_x_discrete(labels = c('Excluded', "Included")) +
+  ggplot2::scale_fill_discrete(labels = c('Excluded', "Included")) +
+  ggplot2::scale_y_continuous(trans = "log10", labels = scales::label_number(accuracy = 1))
+dev.off()
+
+pdf("Plots/Diagnostics/sensitivity_volume.pdf", useDingbats = F)
+sp_sns %>%
+  dplyr::select(-c(alt_cat, mean_alt)) %>%
+  dplyr::mutate(alt_range = alt_range + 1) %>%
+  tidyr::gather(key = "parameter",
+                value = "value",
+                -c(sp, volume)) %>%
+  ggpubr::ggscatter(x = "value",
+                    y = "volume",
+                    xlab = F,
+                    ylab = "Volume of Morphospace",
+                    add = "reg.line",
+                    conf.int = T,
+                    add.params = list(color = "blue")) +
+  ggplot2::facet_wrap(ggplot2::vars(parameter),
+                      nrow = 3,
+                      scales = "free_x",
+                      labeller = ggplot2::labeller(parameter = param.names)) +
+  ggplot2::scale_x_continuous(trans = "log10", labels = scales::label_number(accuracy = 1)) + 
+  ggpubr::yscale(.scale = "log10",
+                 .format = F)
+dev.off()
+```
